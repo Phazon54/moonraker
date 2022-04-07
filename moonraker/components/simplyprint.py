@@ -76,6 +76,7 @@ class SimplyPrint(Subscribable):
         self.last_received_temps: Dict[str, float] = {}
         self.last_err_log_time: float = 0.
         self.last_cpu_update_time: float = 0.
+        self.download_progress: int = -1
         self.intervals: Dict[str, float] = {
             "job": 1.,
             "temps": 1.,
@@ -321,6 +322,22 @@ class SimplyPrint(Subscribable):
             self.webcam_stream.start(interval)
         elif demand == "stream_off":
             self.webcam_stream.stop()
+        elif demand == "file":
+            url: Optional[str] = args.get("url")
+            if not isinstance(url, str):
+                self._logger.info(f"Invalid url in message")
+                return
+            start = bool(args.get("auto_start", 0))
+            self._download_sp_file(url, start)
+        elif demand == "start_print":
+            if (
+                "pending_print" in self.sp_info and
+                self.cache.state == "operational"
+            ):
+                self.sp_info["pending_print"]["start"] = True
+                self.eventloop.create_task(self._process_pending_print())
+            else:
+                self._logger("Failed to start print")
         else:
             self._logger.info(f"Unknown demand: {demand}")
 
@@ -356,6 +373,99 @@ class SimplyPrint(Subscribable):
             # Make sure the event fired so we can reset
             await asyncio.sleep(.05)
             self._update_state(cur_state)
+
+    async def _download_sp_file(self, url: str, start: bool):
+        client: HttpClient = self.server.lookup_component("http_client")
+        fm: FileManager = self.server.lookup_component("file_manager")
+        gc_path = pathlib.Path(fm.get_directory())
+        if not gc_path.is_dir():
+            self._logger.info(f"GCode Path Not Registered: {gc_path}")
+            self._send_sp(
+                "file_progress",
+                {"state": "error", "message": "GCode Path not Registered"}
+            )
+            return
+        url = client.escape_url(url)
+        self._on_download_progress(0, 0, 0)
+        try:
+            tmp_path = await client.download_file(
+                url, "text/plain", progress_callback=self._on_download_progress,
+                request_timeout=3600.
+            )
+        except self.server.error:
+            self._logger.exception(f"Failed to download file: {url}")
+            self._send_sp(
+                "file_progress",
+                {"state": "error", "message": "Network Error"}
+            )
+            return
+        finally:
+            self.download_progress = -1
+        filename = pathlib.PurePath(tmp_path.name)
+        fpath = gc_path.joinpath(filename.name)
+        if self.cache.job_info.get("filename", "") == str(fpath):
+            # This is an attempt to overwite a print in progress, make a copy
+            count = 0
+            while fpath.exists():
+                name = f"{filename.stem}_copy_{count}.{filename.suffix}"
+                fpath = gc_path.joinpath(name)
+                count += 1
+        args: Dict[str, Any] = {
+            "filename": fpath.name,
+            "tmp_file_path": str(tmp_path),
+        }
+        state = "pending"
+        if self.cache.state == "operational":
+            state = "ready"
+            args["print"] = "true" if start else "false"
+        try:
+            ret = await fm.finalize_upload(args)
+        except self.server.error as e:
+            self._logger.exception("GCode Finalization Failed")
+            self._send_sp(
+                "file_progress",
+                {"state": "error", "message": f"GCode Finalization Failed: {e}"}
+            )
+            return
+        if ret["print_started"]:
+            state = "started"
+        if state != "pending":
+            self._send_sp("file_progress", {"state": state})
+        if state != "started":
+            data = {
+                "filename": fpath.name,
+                "start": start,
+                "notified": state != "pending"
+            }
+            self._save_item("pending_print", data)
+
+    async def _process_pending_print(self):
+        if "pending_print" not in self.sp_info:
+            return
+        pending = self.sp_info["pending_print"]
+        data = {"state": "ready"}
+        if pending["start"]:
+            self.sp_info.pop("pending_print", None)
+            self.spdb.pop("pending_print", None)
+            data["state"] = "started"
+            try:
+                await self.klippy_apis.start_print(pending["filename"])
+            except Exception:
+                data["state"] = "error"
+                data["message"] = "Failed to start print"
+        if not pending["notified"]:
+            self._send_sp("file_progress", data)
+            if "pending_print" not in self.sp_info:
+                pending["notified"] = True
+                self._save_item("pending_print", pending)
+
+    def _on_download_progress(self, percent: int, size: int, recd: int) -> None:
+        if percent == self.download_progress:
+            return
+        self.download_progress = percent
+        self._send_sp(
+            "file_progress", {"state": "downloading", "percent": percent}
+        )
 
     async def _on_klippy_ready(self):
         last_stats: Dict[str, Any] = self.job_state.get_last_stats()
@@ -670,6 +780,8 @@ class SimplyPrint(Subscribable):
             return
         self.cache.state = new_state
         self._send_sp("state_change", {"new": new_state})
+        if new_state == "operational":
+            self.eventloop.create_task(self._process_pending_print())
 
     def _send_mesh_data(self) -> None:
         mesh = self.printer_status["bed_mesh"]
@@ -887,6 +999,7 @@ class ReportCache:
         self.cpu_info: Dict[str, Any] = {}
         self.throttled_state: Dict[str, Any] = {}
         self.current_wsid: Optional[int] = None
+        self.download_progress: int = -1
 
     def reset_print_state(self) -> None:
         self.temps = {}
